@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
@@ -12,10 +11,14 @@ type ApprovalRequest = { id: string; prompt: string; plan: unknown; createdAt: s
 
 type VoiceStatus = {
   online: boolean;
-  status: string;
+  status: string; // 'starting' | 'listening' | 'capturing' | 'processing' | 'speaking' | 'paused' | 'error' | 'offline'
   wakeWordActive: boolean;
   listening: boolean;
+  speaking?: boolean;
+  processing?: boolean;
   muted: boolean;
+  paused?: boolean;
+  error?: string | null;
 };
 
 type SystemInfo = {
@@ -91,17 +94,15 @@ export default function App() {
   // Agent mode toggle
   const [agentMode, setAgentMode] = useState(false);
 
-  // Voice (browser)
-  const [listening, setListening] = useState(false);
+  // Browser speech (manual mic & browser TTS fallback)
+  const [manualListening, setManualListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
-  const [voiceEnabled, setVoiceEnabled] = useState(true);
-  const [wakeWordEnabled, setWakeWordEnabled] = useState(false);
-  const [awaitingCommand, setAwaitingCommand] = useState(false);
+  const [browserVoiceEnabled, setBrowserVoiceEnabled] = useState(true);
   const [voiceError, setVoiceError] = useState("");
 
-  // Voice service (background Python)
+  // Background Voice Service (Python - Always Active)
   const [voiceService, setVoiceService] = useState<VoiceStatus>({
-    online: false, status: "offline", wakeWordActive: false, listening: false, muted: false,
+    online: false, status: "offline", wakeWordActive: false, listening: false, speaking: false, processing: false, muted: false, paused: false, error: null,
   });
 
   // Memories
@@ -122,20 +123,15 @@ export default function App() {
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const wakeRecognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const wakeWordEnabledRef = useRef(false);
-  const awaitingCommandRef = useRef(false);
-  const suppressWakeRestartRef = useRef(false);
-  const processingWakeCommandRef = useRef(false);
+  const manualRecognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const sendingRef = useRef(false);
-  const voiceEnabledRef = useRef(true);
+  const browserVoiceEnabledRef = useRef(true);
   const messagesRef = useRef<Message[]>(messages);
 
   // Sync refs
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { sendingRef.current = sending; }, [sending]);
-  useEffect(() => { voiceEnabledRef.current = voiceEnabled; }, [voiceEnabled]);
+  useEffect(() => { browserVoiceEnabledRef.current = browserVoiceEnabled; }, [browserVoiceEnabled]);
 
   // ── Scroll to bottom ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -157,16 +153,21 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  // ── Voice service polling ─────────────────────────────────────────────────
+  // ── Background voice service polling (every 2s for live state updates) ───
   useEffect(() => {
-    const check = async () => {
+    const checkVoice = async () => {
       try {
         const r = await fetch(`${API}/api/voice/status`);
-        if (r.ok) setVoiceService(await r.json());
-      } catch { /* offline */ }
+        if (r.ok) {
+          const data: VoiceStatus = await r.json();
+          setVoiceService(data);
+        }
+      } catch {
+        setVoiceService(prev => ({ ...prev, online: false, status: "offline" }));
+      }
     };
-    void check();
-    const t = setInterval(check, 5_000);
+    void checkVoice();
+    const t = setInterval(checkVoice, 2_000);
     return () => clearInterval(t);
   }, []);
 
@@ -206,9 +207,7 @@ export default function App() {
 
   // ── Cleanup ────────────────────────────────────────────────────────────────
   useEffect(() => () => {
-    wakeWordEnabledRef.current = false;
-    recognitionRef.current?.abort();
-    wakeRecognitionRef.current?.abort();
+    manualRecognitionRef.current?.abort();
     window.speechSynthesis?.cancel();
   }, []);
 
@@ -220,7 +219,7 @@ export default function App() {
   }
 
   const speakResponse = useCallback((text: string, onDone?: () => void) => {
-    if (!voiceEnabledRef.current || !("speechSynthesis" in window)) {
+    if (!browserVoiceEnabledRef.current || !("speechSynthesis" in window)) {
       setSpeaking(false); onDone?.(); return;
     }
     window.speechSynthesis.cancel();
@@ -234,12 +233,9 @@ export default function App() {
 
   // ── Send message ──────────────────────────────────────────────────────────
 
-  async function sendText(text: string, resumeWake = false) {
+  async function sendText(text: string) {
     const clean = text.trim();
-    if (!clean || sendingRef.current) {
-      if (resumeWake) { processingWakeCommandRef.current = false; startWakeWordMonitoring(); }
-      return;
-    }
+    if (!clean || sendingRef.current) return;
 
     setVoiceError("");
     sendingRef.current = true;
@@ -280,152 +276,35 @@ export default function App() {
     sendingRef.current = false;
     setSending(false);
 
-    if (resumeWake && wakeWordEnabledRef.current) {
-      processingWakeCommandRef.current = false;
-      speakResponse(reply, () => { if (wakeWordEnabledRef.current) startWakeWordMonitoring(); });
-    } else {
-      speakResponse(reply);
-    }
+    speakResponse(reply);
   }
 
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault(); void sendText(input);
   };
 
-  // ── Wake word ─────────────────────────────────────────────────────────────
+  // ── Manual Dictation (Optional Browser Mic) ───────────────────────────────
 
-  function startWakeWordMonitoring() {
-    if (!wakeWordEnabledRef.current || sendingRef.current || processingWakeCommandRef.current) return;
-    if (wakeRecognitionRef.current) return;
+  function toggleManualMic() {
+    setVoiceError("");
     const SR = getSR();
-    if (!SR) { setVoiceError("Wake-word not supported. Try Chrome."); return; }
-
-    try {
-      const r = new SR();
-      r.lang = "en-IN"; r.continuous = false; r.interimResults = false;
-
-      r.onresult = (e) => {
-        const rawResults = e.results as unknown as Array<{ [i: number]: { transcript: string }; isFinal: boolean }>;
-        const transcript = rawResults.map(res => res[0]?.transcript ?? "").join(" ").trim();
-        if (!transcript) return;
-        const m = transcript.match(/\b(?:hey\s+)?jarvis\b[\s,.:;!?-]*(.*)/i);
-        if (!m) return;
-
-        suppressWakeRestartRef.current = true;
-        wakeRecognitionRef.current = null;
-        r.abort();
-
-        const cmd = (m[1] || "").trim();
-        if (cmd) {
-          processingWakeCommandRef.current = true;
-          setInput(cmd);
-          void sendText(cmd, true);
-        } else {
-          awaitingCommandRef.current = true;
-          setAwaitingCommand(true);
-          speakResponse("Yes, Sir?", () => { if (wakeWordEnabledRef.current) startCommandAfterWake(); });
-        }
-      };
-
-      r.onerror = (e) => {
-        wakeRecognitionRef.current = null;
-        if (e.error === "not-allowed") { setVoiceError("Microphone access denied."); wakeWordEnabledRef.current = false; setWakeWordEnabled(false); }
-        else if (e.error !== "aborted" && e.error !== "no-speech") setVoiceError(`Wake error: ${e.error}`);
-      };
-
-      r.onend = () => {
-        wakeRecognitionRef.current = null;
-        if (suppressWakeRestartRef.current) { suppressWakeRestartRef.current = false; return; }
-        if (wakeWordEnabledRef.current && !awaitingCommandRef.current && !processingWakeCommandRef.current) {
-          setTimeout(startWakeWordMonitoring, 400);
-        }
-      };
-
-      wakeRecognitionRef.current = r;
-      r.start();
-      setVoiceError("");
-    } catch { wakeRecognitionRef.current = null; setVoiceError("Could not start wake-word monitoring."); }
-  }
-
-  function startCommandAfterWake() {
-    const SR = getSR();
-    if (!SR || !wakeWordEnabledRef.current) return;
-    try {
-      const r = new SR();
-      r.lang = "en-IN"; r.continuous = false; r.interimResults = false;
-      wakeRecognitionRef.current = r;
-
-      r.onresult = (e) => {
-        const rawResults = e.results as unknown as Array<{ [i: number]: { transcript: string }; isFinal: boolean }>;
-        const cmd = rawResults.map(res => res[0]?.transcript ?? "").join(" ").trim();
-        if (!cmd) return;
-        processingWakeCommandRef.current = true;
-        awaitingCommandRef.current = false;
-        setAwaitingCommand(false);
-        setInput(cmd);
-        void sendText(cmd, true);
-      };
-
-      r.onerror = (e) => {
-        if (e.error === "no-speech") setVoiceError("Didn't catch that. Say Hey JARVIS to retry.");
-        else if (e.error !== "aborted") setVoiceError(`Command error: ${e.error}`);
-      };
-
-      r.onend = () => {
-        wakeRecognitionRef.current = null;
-        if (awaitingCommandRef.current) {
-          awaitingCommandRef.current = false;
-          setAwaitingCommand(false);
-          if (wakeWordEnabledRef.current && !processingWakeCommandRef.current) setTimeout(startWakeWordMonitoring, 500);
-        }
-      };
-
-      r.start();
-    } catch {
-      wakeRecognitionRef.current = null;
-      awaitingCommandRef.current = false;
-      setAwaitingCommand(false);
-      startWakeWordMonitoring();
-    }
-  }
-
-  function enableWakeWord() {
+    if (!SR) { setVoiceError("Manual browser dictation requires Chrome/Edge."); return; }
     if (sendingRef.current) { setVoiceError("Wait for JARVIS to finish responding."); return; }
-    recognitionRef.current?.abort(); recognitionRef.current = null; setListening(false);
-    window.speechSynthesis?.cancel(); setSpeaking(false);
-    wakeWordEnabledRef.current = true;
-    awaitingCommandRef.current = false;
-    processingWakeCommandRef.current = false;
-    setWakeWordEnabled(true);
-    setAwaitingCommand(false);
-    setVoiceError("");
-    startWakeWordMonitoring();
-  }
 
-  function stopWakeWord() {
-    wakeWordEnabledRef.current = false;
-    awaitingCommandRef.current = false;
-    processingWakeCommandRef.current = false;
-    setWakeWordEnabled(false);
-    setAwaitingCommand(false);
-    suppressWakeRestartRef.current = true;
-    wakeRecognitionRef.current?.abort();
-    wakeRecognitionRef.current = null;
-  }
+    if (manualListening) {
+      manualRecognitionRef.current?.stop();
+      setManualListening(false);
+      return;
+    }
 
-  function startListening() {
-    setVoiceError("");
-    const SR = getSR();
-    if (!SR) { setVoiceError("Voice input requires Chrome."); return; }
-    if (sendingRef.current) { setVoiceError("Wait for JARVIS to finish."); return; }
-    if (wakeWordEnabledRef.current) { setVoiceError("Disable Hey JARVIS before using manual mic."); return; }
-    if (listening) { recognitionRef.current?.stop(); setListening(false); return; }
-
-    window.speechSynthesis?.cancel(); setSpeaking(false);
+    window.speechSynthesis?.cancel();
+    setSpeaking(false);
 
     try {
       const r = new SR();
-      r.lang = "en-IN"; r.continuous = false; r.interimResults = false;
+      r.lang = "en-IN";
+      r.continuous = false;
+      r.interimResults = false;
       r.onresult = (e) => {
         const rawResults = e.results as unknown as Array<{ [i: number]: { transcript: string }; isFinal: boolean }>;
         const t = rawResults.map(res => res[0]?.transcript ?? "").join(" ").trim();
@@ -433,15 +312,43 @@ export default function App() {
       };
       r.onerror = (e) => {
         if (e.error === "not-allowed") setVoiceError("Microphone access denied.");
-        else if (e.error === "no-speech") setVoiceError("Didn't hear anything.");
-        else if (e.error !== "aborted") setVoiceError(`Voice error: ${e.error}`);
-        setListening(false);
+        else if (e.error === "no-speech") setVoiceError("Didn't catch any speech.");
+        else if (e.error !== "aborted") setVoiceError(`Mic error: ${e.error}`);
+        setManualListening(false);
       };
-      r.onend = () => { setListening(false); recognitionRef.current = null; };
-      recognitionRef.current = r;
+      r.onend = () => { setManualListening(false); manualRecognitionRef.current = null; };
+      manualRecognitionRef.current = r;
       r.start();
-      setListening(true);
-    } catch { setListening(false); setVoiceError("Could not start microphone."); }
+      setManualListening(true);
+    } catch {
+      setManualListening(false);
+      setVoiceError("Could not start microphone.");
+    }
+  }
+
+  // ── Voice Service Control (Pause / Resume / Mute / Unmute) ────────────────
+
+  async function sendVoiceControl(cmd: "pause" | "resume" | "mute" | "unmute") {
+    try {
+      const r = await fetch(`${API}/api/voice/control`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: cmd }),
+      });
+      if (r.ok) {
+        if (cmd === "pause") {
+          setVoiceService(prev => ({ ...prev, paused: true, status: "paused", wakeWordActive: false, listening: false }));
+        } else if (cmd === "resume") {
+          setVoiceService(prev => ({ ...prev, paused: false, status: "listening", wakeWordActive: true, listening: true }));
+        } else if (cmd === "mute") {
+          setVoiceService(prev => ({ ...prev, muted: true }));
+        } else if (cmd === "unmute") {
+          setVoiceService(prev => ({ ...prev, muted: false }));
+        }
+      }
+    } catch {
+      setVoiceError("Could not send control command to voice service.");
+    }
   }
 
   // ── Memories ──────────────────────────────────────────────────────────────
@@ -490,16 +397,32 @@ export default function App() {
     if (r.ok) { setProvider(p); setSelectedProvider(p); }
   }
 
-  // ── Status indicators ─────────────────────────────────────────────────────
+  // ── Live Status Indicator Calculation ─────────────────────────────────────
 
-  const assistantState = awaitingCommand
-    ? "WAKE WORD DETECTED · AWAITING COMMAND"
-    : wakeWordEnabled ? "HEY JARVIS MONITORING ACTIVE"
-    : listening ? "LISTENING FOR COMMAND"
-    : speaking ? "SPEAKING"
-    : sending ? `PROCESSING${agentMode ? " (AGENT)" : ""}`
-    : backendOnline ? "SYSTEMS NOMINAL"
-    : "AWAITING CONNECTION";
+  let assistantState = "AWAITING CONNECTION";
+  if (backendOnline) {
+    if (sending) {
+      assistantState = `PROCESSING${agentMode ? " (AGENT)" : ""}`;
+    } else if (!voiceService.online) {
+      assistantState = "VOICE SERVICE OFFLINE";
+    } else if (voiceService.error) {
+      assistantState = `MIC ERROR: ${voiceService.error.toUpperCase()}`;
+    } else if (voiceService.paused || voiceService.status === "paused") {
+      assistantState = "VOICE SERVICE PAUSED";
+    } else if (voiceService.speaking || voiceService.status === "speaking" || speaking) {
+      assistantState = "SPEAKING";
+    } else if (voiceService.processing || voiceService.status === "processing") {
+      assistantState = "PROCESSING COMMAND";
+    } else if (voiceService.listening || voiceService.status === "capturing" || manualListening) {
+      assistantState = "LISTENING FOR COMMAND";
+    } else if (voiceService.wakeWordActive || voiceService.status === "listening") {
+      assistantState = "JARVIS IS LISTENING";
+    } else if (voiceService.status === "starting") {
+      assistantState = "VOICE SERVICE STARTING";
+    } else {
+      assistantState = "JARVIS IS READY";
+    }
+  }
 
   const pendingCount = approvals.length;
 
@@ -543,12 +466,15 @@ export default function App() {
           <div className="reactor-core">J</div>
         </div>
 
-        <p className={`assistant-state ${sending ? "pulsing" : ""}`}>{assistantState}</p>
+        <p className={`assistant-state ${sending || voiceService.processing ? "pulsing" : ""}`}>{assistantState}</p>
 
         <div className="voice-service-status">
-          <span className={`vs-dot ${voiceService.online ? "online" : ""}`} />
-          <span>VOICE SERVICE: {voiceService.online ? voiceService.status.toUpperCase() : "OFFLINE"}</span>
+          <span className={`vs-dot ${voiceService.online && !voiceService.error ? (voiceService.paused ? "paused" : "online") : ""}`} />
+          <span>
+            VOICE SERVICE: {voiceService.online ? voiceService.status.toUpperCase() : "OFFLINE"}
+          </span>
           {voiceService.online && voiceService.muted && <span className="vs-badge">MUTED</span>}
+          {voiceService.online && voiceService.paused && <span className="vs-badge">PAUSED</span>}
         </div>
       </section>
 
@@ -616,52 +542,97 @@ export default function App() {
             </button>
           </form>
 
+          {/* ── Voice Controls ── */}
           <div className="voice-controls">
             <button
-              id="btn-listen"
+              id="btn-pause-voice"
               type="button"
-              onClick={startListening}
-              disabled={sending || wakeWordEnabled}
-              aria-pressed={listening}
-              className={listening ? "voice-active" : ""}
+              disabled={!voiceService.online}
+              onClick={() => sendVoiceControl(voiceService.paused ? "resume" : "pause")}
+              aria-pressed={voiceService.paused}
+              className={voiceService.paused ? "voice-active" : ""}
+              title="Pause or resume always-on background wake-word listening"
             >
-              {listening ? "⏹ Stop" : "🎙️ Speak"}
+              {voiceService.paused ? "▶️ Resume Listening" : "⏸️ Pause Listening"}
             </button>
 
             <button
-              id="btn-wake"
+              id="btn-mute-voice"
               type="button"
-              onClick={() => wakeWordEnabled ? stopWakeWord() : enableWakeWord()}
-              disabled={sending && !wakeWordEnabled}
-              aria-pressed={wakeWordEnabled}
-              className={wakeWordEnabled ? "voice-active" : ""}
+              disabled={!voiceService.online}
+              onClick={() => sendVoiceControl(voiceService.muted ? "unmute" : "mute")}
+              aria-pressed={voiceService.muted}
+              title="Mute or unmute spoken responses from JARVIS"
             >
-              {wakeWordEnabled ? "⏹ Disable Hey JARVIS" : "🎤 Enable Hey JARVIS"}
+              {voiceService.muted ? "🔊 Unmute JARVIS" : "🔇 Mute JARVIS"}
+            </button>
+
+            <button
+              id="btn-listen"
+              type="button"
+              onClick={toggleManualMic}
+              disabled={sending}
+              aria-pressed={manualListening}
+              className={manualListening ? "voice-active" : ""}
+              title="Click to dictate directly into the text input box"
+            >
+              {manualListening ? "⏹ Stop Mic" : "🎙️ Speak"}
             </button>
 
             <button
               id="btn-voice-toggle"
               type="button"
               onClick={() => {
-                if (voiceEnabledRef.current) { window.speechSynthesis?.cancel(); setSpeaking(false); voiceEnabledRef.current = false; setVoiceEnabled(false); }
-                else { voiceEnabledRef.current = true; setVoiceEnabled(true); setVoiceError(""); }
+                if (browserVoiceEnabledRef.current) {
+                  window.speechSynthesis?.cancel();
+                  setSpeaking(false);
+                  browserVoiceEnabledRef.current = false;
+                  setBrowserVoiceEnabled(false);
+                } else {
+                  browserVoiceEnabledRef.current = true;
+                  setBrowserVoiceEnabled(true);
+                  setVoiceError("");
+                }
               }}
-              aria-pressed={voiceEnabled}
+              aria-pressed={browserVoiceEnabled}
+              title="Toggle browser text-to-speech for typed messages"
             >
-              {voiceEnabled ? "🔊 Voice On" : "🔇 Voice Off"}
+              {browserVoiceEnabled ? "🔊 Browser Voice On" : "🔇 Browser Voice Off"}
             </button>
 
             {speaking && (
-              <button id="btn-stop-speaking" type="button" onClick={() => { window.speechSynthesis?.cancel(); setSpeaking(false); }}>
+              <button
+                id="btn-stop-speaking"
+                type="button"
+                onClick={() => { window.speechSynthesis?.cancel(); setSpeaking(false); }}
+              >
                 ⏹ Stop Speaking
               </button>
             )}
           </div>
 
+          {/* ── Real Status Messages ── */}
           {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
-          {awaitingCommand && <p className="voice-status">JARVIS is listening for your command…</p>}
-          {listening && <p className="voice-status">Listening… speak clearly then pause.</p>}
-          {wakeWordEnabled && !awaitingCommand && <p className="voice-status">Say "Hey JARVIS" to activate.</p>}
+          {voiceService.error && <p className="voice-error" role="alert">Microphone: {voiceService.error}</p>}
+
+          {voiceService.online && (voiceService.status === "listening" || voiceService.wakeWordActive) && (
+            <p className="voice-status">JARVIS is listening for the wake word. Say "Hey JARVIS" or "JARVIS" at any time.</p>
+          )}
+          {voiceService.online && (voiceService.status === "capturing" || voiceService.listening) && (
+            <p className="voice-status">JARVIS is listening for your command…</p>
+          )}
+          {voiceService.online && (voiceService.status === "processing" || voiceService.processing) && (
+            <p className="voice-status">JARVIS is processing your command…</p>
+          )}
+          {voiceService.online && (voiceService.status === "speaking" || voiceService.speaking) && (
+            <p className="voice-status">JARVIS is speaking…</p>
+          )}
+          {voiceService.online && voiceService.paused && (
+            <p className="voice-status">Wake-word listening is paused. Click Resume Listening to re-enable.</p>
+          )}
+          {!voiceService.online && (
+            <p className="voice-status muted">Background voice service is offline. Run start-jarvis.ps1 or start-voice.ps1 to start listening.</p>
+          )}
         </section>
       )}
 
@@ -688,7 +659,7 @@ export default function App() {
                 key={cmd}
                 className="agent-action-btn"
                 disabled={sending}
-                onClick={() => { setTab("chat"); setTimeout(() => void sendText(cmd, false), 100); setAgentMode(true); }}
+                onClick={() => { setTab("chat"); setTimeout(() => void sendText(cmd), 100); setAgentMode(true); }}
               >
                 {label}
               </button>
@@ -697,7 +668,7 @@ export default function App() {
 
           <div className="agent-custom">
             <p className="eyebrow">CUSTOM COMMAND</p>
-            <form className="command-form" onSubmit={e => { e.preventDefault(); setTab("chat"); setAgentMode(true); setTimeout(() => void sendText(input, false), 100); }}>
+            <form className="command-form" onSubmit={e => { e.preventDefault(); setTab("chat"); setAgentMode(true); setTimeout(() => void sendText(input), 100); }}>
               <input
                 value={input}
                 onChange={e => setInput(e.target.value)}
@@ -813,10 +784,10 @@ export default function App() {
 
             <div className="status-card">
               <h4>Voice Service</h4>
-              <div className={`status-indicator ${voiceService.online ? "ok" : "err"}`}>
+              <div className={`status-indicator ${voiceService.online && !voiceService.error ? "ok" : "err"}`}>
                 ● {voiceService.online ? voiceService.status.toUpperCase() : "OFFLINE"}
               </div>
-              <p>Wake word: {voiceService.wakeWordActive ? "active" : "inactive"}</p>
+              <p>Wake word: {voiceService.online && voiceService.status === "listening" ? "actively listening" : voiceService.status}</p>
             </div>
 
             <div className="status-card">
@@ -898,30 +869,30 @@ export default function App() {
           </div>
 
           <div className="settings-group">
-            <h4>Voice Service (Browser)</h4>
-            <p>Uses browser's built-in Speech Recognition API. Only available in Chrome/Edge.</p>
-            <div className="voice-controls" style={{ marginTop: 10 }}>
-              <button type="button" onClick={startListening} disabled={sending || wakeWordEnabled} className={listening ? "voice-active" : ""}>
-                {listening ? "⏹ Stop Listening" : "🎙️ Manual Listen"}
-              </button>
-              <button type="button" onClick={() => wakeWordEnabled ? stopWakeWord() : enableWakeWord()} className={wakeWordEnabled ? "voice-active" : ""}>
-                {wakeWordEnabled ? "⏹ Disable Hey JARVIS" : "🎤 Enable Hey JARVIS"}
-              </button>
-              <button type="button" onClick={() => { voiceEnabledRef.current = !voiceEnabledRef.current; setVoiceEnabled(voiceEnabledRef.current); }}>
-                {voiceEnabled ? "🔊 Voice On" : "🔇 Voice Off"}
-              </button>
-            </div>
-          </div>
-
-          <div className="settings-group">
-            <h4>Background Voice Service (Python)</h4>
-            <p className={voiceService.online ? "status-ok" : "status-err"}>
-              Status: {voiceService.online ? "Online" : "Offline"}
+            <h4>Background Voice Service (Python — Always-On)</h4>
+            <p className={voiceService.online && !voiceService.error ? "status-ok" : "status-err"}>
+              Status: {voiceService.online ? voiceService.status.toUpperCase() : "Offline"}
+              {voiceService.error && ` (${voiceService.error})`}
             </p>
             <p className="settings-note">
-              Run <code>services\voice\start-voice.ps1</code> to start the background service.
-              It detects wake words locally without streaming audio to the cloud.
+              The Python voice service starts automatically with JARVIS and listens continuously for "Hey JARVIS" or "JARVIS" using local openwakeword. No manual browser button is required.
             </p>
+            <div className="voice-controls" style={{ marginTop: 10 }}>
+              <button
+                type="button"
+                disabled={!voiceService.online}
+                onClick={() => sendVoiceControl(voiceService.paused ? "resume" : "pause")}
+              >
+                {voiceService.paused ? "▶️ Resume Listening" : "⏸️ Pause Listening"}
+              </button>
+              <button
+                type="button"
+                disabled={!voiceService.online}
+                onClick={() => sendVoiceControl(voiceService.muted ? "unmute" : "mute")}
+              >
+                {voiceService.muted ? "🔊 Unmute Voice" : "🔇 Mute Voice"}
+              </button>
+            </div>
           </div>
 
           <div className="settings-group">

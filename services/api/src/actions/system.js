@@ -185,6 +185,7 @@ export async function cancelShutdown() {
 
         return {
             success: true,
+            cancelled: true,
             message: "Pending shutdown has been cancelled successfully.",
         };
     } catch (error) {
@@ -197,13 +198,15 @@ export async function cancelShutdown() {
             stderr.toLowerCase().includes("1116")
         ) {
             return {
-                success: false,
+                success: true,
+                cancelled: false,
                 message: "No shutdown was currently scheduled.",
             };
         }
 
         return {
             success: false,
+            cancelled: false,
             message: `Could not cancel shutdown: ${stderr || error.message}`,
         };
     }

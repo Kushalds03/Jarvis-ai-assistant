@@ -10,61 +10,89 @@
 import { ACTION_REGISTRY } from "../actions/registry.js";
 import { JARVIS_CONFIG, resolveApp, resolveProject } from "../actions/config.js";
 
+// ─── Command Normalization ───────────────────────────────────────────────────
+
+/**
+ * Clean and normalize incoming command text safely.
+ * Strips wake phrases and conversational filler while preserving critical intent words
+ * (like "cancel", "stop", "shutdown", etc.).
+ */
+export function normalizeCommand(rawMessage) {
+    if (!rawMessage || typeof rawMessage !== "string") return "";
+    let text = rawMessage.trim();
+
+    // Remove leading wake phrases safely: "hey jarvis", "jarvis", "ok jarvis", "hi jarvis"
+    text = text.replace(/^(?:(?:hey|ok|hi|hello)\s+)?jarvis[,:\s]*/i, "");
+
+    // Remove polite leading phrases while preserving meaning
+    text = text.replace(/^(?:please\s+|could\s+you\s+(?:please\s+)?|can\s+you\s+(?:please\s+)?|would\s+you\s+(?:please\s+)?|kindly\s+)/i, "");
+
+    // Trim trailing punctuation
+    text = text.replace(/[.?!]+$/, "").trim();
+
+    // Collapse whitespace
+    text = text.replace(/\s+/g, " ");
+
+    return text;
+}
+
 // ─── Intent Classification ────────────────────────────────────────────────────
 
 const INTENT_PATTERNS = [
     // System
     {
         intent: "LOCK_PC",
-        patterns: [/\block\s*(my\s*)?(?:pc|computer|screen|workstation)\b/i],
+        patterns: [/\block\s*(?:my\s*|the\s*)?(?:pc|computer|screen|workstation)\b/i],
         actions: [{ actionId: "LOCK_PC", args: {} }],
     },
     {
+        intent: "CANCEL_SHUTDOWN",
+        patterns: [/\b(?:cancel|abort|stop)\s*(?:the\s*)?(?:pending\s*)?(?:shutdown|restart|reboot|power\s*off)\b/i],
+        actions: [{ actionId: "CANCEL_SHUTDOWN", args: {} }],
+    },
+    {
         intent: "SHUTDOWN_PC",
-        patterns: [/\b(shut\s*down|shutdown|power\s*off|turn\s*off)\s*(my\s*)?(?:pc|computer|system)\b/i],
+        patterns: [/\b(shut\s*down|shutdown|power\s*off|turn\s*off)\s*(?:my\s*|the\s*)?(?:pc|computer|system)\b/i],
         actions: null, // needs dynamic args (delay)
     },
     {
         intent: "RESTART_PC",
-        patterns: [/\b(restart|reboot|reset)\s*(my\s*)?(?:pc|computer|system)\b/i],
+        patterns: [/\b(restart|reboot|reset)\s*(?:my\s*|the\s*)?(?:pc|computer|system)\b/i],
         actions: null,
-    },
-    {
-        intent: "CANCEL_SHUTDOWN",
-        patterns: [/\bcancel\s*(the\s*)?(shutdown|restart|reboot|power\s*off)\b/i],
-        actions: [{ actionId: "CANCEL_SHUTDOWN", args: {} }],
     },
     {
         intent: "GET_SYSTEM_INFO",
         patterns: [
-            /\b(what\s*time|current\s*time|what('s|\s*is)\s*the\s*time)\b/i,
-            /\bsystem\s*(info|status|information)\b/i,
-            /\bhow\s*(much|many)\s*(ram|memory|cpu)\b/i,
+            /\b(?:what\s*time|current\s*time|what('s|\s*is)\s*(?:the\s*)?time|tell\s*(?:me\s*)?(?:the\s*)?(?:current\s*)?time)\b/i,
+            /\b(?:show\s*(?:me\s*)?)?system\s*(?:info|status|information)\b/i,
+            /\bhow\s*(?:much|many)\s*(?:ram|memory|cpu)\b/i,
         ],
         actions: [{ actionId: "GET_SYSTEM_INFO", args: {} }],
+    },
+
+    // Navigation & Projects (checked before generic app launcher)
+    {
+        intent: "OPEN_DASHBOARD",
+        patterns: [/\b(?:open|launch|show)\s*(?:my\s*|the\s*)?(?:dashboard|jarvis\s*dashboard|ui|interface)\b/i],
+        actions: [{ actionId: "OPEN_URL", args: { url: "http://localhost:5173" } }],
+    },
+    {
+        intent: "OPEN_FOLDER",
+        patterns: [
+            /\b(?:open|explore|show)\s*(?:my\s*|the\s*)?(?:jarvis\s*)?(?:project|folder|directory|project\s*folder|workspace|code)\b/i,
+            /\bexplore\s+(.+)/i,
+        ],
+        actions: null,
     },
 
     // Applications
     {
         intent: "OPEN_APP",
         patterns: [
-            /\b(open|launch|start|run|show)\s+(?!my\s*files)(?!folder)(?!dashboard)(.+)/i,
+            /\b(?:open|launch|start|run|show)\s+(?!my\s*files)(?!folder)(?!dashboard)(?!the\s*folder)(?!project)(.+)/i,
             /\bbring\s*up\s+(.+)/i,
         ],
         actions: null, // dynamic – extract app name
-    },
-    {
-        intent: "OPEN_DASHBOARD",
-        patterns: [/\bopen\s*(my\s*)?(dashboard|jarvis\s*dashboard|ui|interface)\b/i],
-        actions: [{ actionId: "OPEN_URL", args: { url: "http://localhost:5173" } }],
-    },
-    {
-        intent: "OPEN_FOLDER",
-        patterns: [
-            /\bopen\s*(my\s*)?(folder|directory|files?\s*in|project\s*folder)\b/i,
-            /\bexplore\s+(.+)/i,
-        ],
-        actions: null,
     },
 
     // Git
@@ -125,7 +153,9 @@ const INTENT_PATTERNS = [
  * Returns null when the request needs AI planning.
  */
 export function classifyIntent(message) {
-    const text = message.trim();
+    if (!message || typeof message !== "string") return null;
+    const text = normalizeCommand(message);
+    if (!text) return null;
 
     for (const rule of INTENT_PATTERNS) {
         for (const pattern of rule.patterns) {
@@ -155,9 +185,12 @@ function buildDynamicPlan(intent, text, match) {
     switch (intent) {
         case "OPEN_APP": {
             // Extract what comes after "open", "launch", "start", etc.
-            const appQuery =
-                match[2]?.trim() ||
+            let appQuery =
+                match[1]?.trim() ||
                 text.replace(/^(open|launch|start|run|show|bring up)\s+/i, "").trim();
+
+            // Strip leading "the" or "my" if present
+            appQuery = appQuery.replace(/^(?:the|my)\s+/i, "").trim();
 
             const app = resolveApp(appQuery);
 
@@ -181,6 +214,7 @@ function buildDynamicPlan(intent, text, match) {
                     intent,
                     confidence: "pattern",
                     steps: [{ actionId: "OPEN_FOLDER", args: { folderPath: project.path } }],
+                    folderName: project.name,
                 };
             }
 

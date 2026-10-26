@@ -111,9 +111,14 @@ ollama pull qwen2.5:3b
 
 ## Daily Usage
 
-### Start everything
+### Start in development mode (API + Frontend + Voice + Browser)
 ```powershell
 .\start-jarvis.ps1
+```
+
+### Start in background assistant mode (API + Voice, headless)
+```powershell
+.\start-jarvis.ps1 -Background
 ```
 
 ### Start without voice service
@@ -196,28 +201,43 @@ If Gemini fails, JARVIS automatically falls back to Ollama.
 
 ## Background Voice Service
 
-The Python voice service runs independently of the browser.
+The Python voice service runs independently of the browser and starts automatically with `start-jarvis.ps1`.
+It initializes the microphone immediately and listens continuously for **"Hey JARVIS"** or **"JARVIS"** without requiring any manual dashboard button.
 
 ```powershell
-# Start
+# Start directly
 .\services\voice\start-voice.ps1
 
-# Stop
+# Pause wake-word listening
+.\services\voice\control-voice.ps1 -Command pause
+# Or: .\scripts\manage-jarvis.ps1 -Action pause-voice
+
+# Resume wake-word listening
+.\services\voice\control-voice.ps1 -Command resume
+# Or: .\scripts\manage-jarvis.ps1 -Action resume-voice
+
+# Mute spoken responses
+.\services\voice\control-voice.ps1 -Command mute
+# Or: .\scripts\manage-jarvis.ps1 -Action mute-voice
+
+# Unmute spoken responses
+.\services\voice\control-voice.ps1 -Command unmute
+# Or: .\scripts\manage-jarvis.ps1 -Action unmute-voice
+
+# Stop the voice service
 .\services\voice\stop-voice.ps1
 
 # View logs
 .\scripts\manage-jarvis.ps1 -Action logs
 ```
 
-### Wake word detection
-- **Primary**: `openwakeword` — fully local, no cloud, detects "hey_jarvis"
-- **Fallback**: `SpeechRecognition` + Google Web Speech API keyword matching
-  - Only sends audio to Google when speech energy is detected
-  - NOT continuous streaming — only triggered by voice activity
+### Voice Lifecycle
+`STARTUP -> MIC INITIALIZED -> WAKE-WORD LISTENING -> "YES, SIR?" -> COMMAND CAPTURE -> AI/AGENT EXECUTION -> SPOKEN RESPONSE -> RESUME LISTENING`
 
-### TTS
-- Uses Windows SAPI5 voices via `pyttsx3` (fully offline)
-- Prefers David/Mark voices; falls back to any installed English voice
+- **Automatic Wake-Word**: Uses local `openwakeword` (`hey_jarvis`), zero cloud audio streaming during monitoring.
+- **Echo-Free**: Pauses microphone during speech synthesis and adds reverb delay before resuming wake-word detection.
+- **Offline TTS**: Uses Windows SAPI5 via `pyttsx3`.
+- **Works Without Browser**: Wake-word monitoring remains active even when the dashboard is closed.
 
 ---
 

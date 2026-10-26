@@ -131,7 +131,7 @@ export const JARVIS_CONFIG = {
     projects: {
         jarvis: {
             name: "JARVIS Project",
-            aliases: ["jarvis", "this project", "my assistant", "ai assistant"],
+            aliases: ["jarvis", "this project", "my assistant", "ai assistant", "jarvis project", "project folder", "project", "code folder", "workspace"],
             path: "D:\\Sigma batch\\Jarvis",
             type: "node",
             packageManager: "npm",
@@ -183,12 +183,17 @@ export const JARVIS_CONFIG = {
  * Returns the full app definition or null.
  */
 export function resolveApp(query) {
-    const q = query.toLowerCase().trim();
+    if (!query || typeof query !== "string") return null;
+    let q = query.toLowerCase().trim();
+    // Strip trailing punctuation and common filler
+    q = q.replace(/[.?!]+$/, "").trim();
+    q = q.replace(/\s+(app|application|program|software|browser|editor)$/i, "").trim();
+
     for (const [key, app] of Object.entries(JARVIS_CONFIG.applications)) {
         if (
             key === q ||
             app.name.toLowerCase() === q ||
-            app.aliases.some((a) => q.includes(a) || a.includes(q))
+            app.aliases.some((a) => q === a || q.includes(a) || a.includes(q))
         ) {
             return { key, ...app };
         }
@@ -198,24 +203,26 @@ export function resolveApp(query) {
 
 /**
  * Find a registered project by key or alias.
- * If only one project is configured, return it automatically.
+ * Only matches if query actually contains project/folder keywords or matches a registered alias.
  */
 export function resolveProject(query) {
-    const q = (query || "").toLowerCase().trim();
+    if (!query || typeof query !== "string") return null;
+    const q = query.toLowerCase().trim().replace(/[.?!]+$/, "").trim();
     const entries = Object.entries(JARVIS_CONFIG.projects);
 
     for (const [key, project] of entries) {
         if (
             key === q ||
             project.name.toLowerCase() === q ||
-            (project.aliases || []).some((a) => q.includes(a) || a.includes(q))
+            (project.aliases || []).some((a) => q === a || q.includes(a) || a.includes(q))
         ) {
             return { key, ...project };
         }
     }
 
-    // Default to the only project when there is exactly one.
-    if (entries.length === 1) {
+    // Default to the primary project ONLY if the query specifically refers to a project, repo, or folder
+    const isProjectQuery = /\b(project|workspace|repo|repository|code|jarvis)\b/i.test(q);
+    if (isProjectQuery && entries.length >= 1) {
         const [key, project] = entries[0];
         return { key, ...project };
     }

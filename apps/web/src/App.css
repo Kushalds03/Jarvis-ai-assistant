@@ -287,6 +287,11 @@ a { color: var(--cyan); }
   animation: pulse-dot 2s ease-in-out infinite;
 }
 
+.vs-dot.paused {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber);
+}
+
 .vs-badge {
   padding: 1px 6px;
   border-radius: 4px;

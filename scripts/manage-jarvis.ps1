@@ -8,6 +8,10 @@
 #   status          - Show service status
 #   start-voice     - Start the background voice service
 #   stop-voice      - Stop the background voice service
+#   pause-voice     - Pause wake-word listening
+#   resume-voice    - Resume wake-word listening
+#   mute-voice      - Mute spoken responses
+#   unmute-voice    - Unmute spoken responses
 #   logs            - Open the voice service log
 #   enable-startup  - Register JARVIS for automatic Windows startup (requires approval)
 #   disable-startup - Remove JARVIS from Windows startup
@@ -15,46 +19,71 @@
 
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("start","stop","restart","status","start-voice","stop-voice","logs","enable-startup","disable-startup","check-startup")]
+    [ValidateSet("start","stop","restart","status","start-voice","stop-voice","pause-voice","resume-voice","mute-voice","unmute-voice","logs","enable-startup","disable-startup","check-startup")]
     [string]$Action
 )
 
-$rootDir    = "D:\Sigma batch\Jarvis"
-$apiDir     = "$rootDir\services\api"
-$webDir     = "$rootDir\apps\web"
-$voiceDir   = "$rootDir\services\voice"
+$rootDir = Split-Path -Parent $PSScriptRoot
+if (-not $rootDir) { $rootDir = "D:\Sigma batch\Jarvis" }
+$apiDir     = Join-Path $rootDir "services\api"
+$webDir     = Join-Path $rootDir "apps\web"
+$voiceDir   = Join-Path $rootDir "services\voice"
 $taskName   = "JARVIS-AI-Assistant"
 
-# ── Helper ─────────────────────────────────────────────────────────────────
+# -- Helpers -----------------------------------------------------------------
 function Write-Step { param($msg) Write-Host "[JARVIS] $msg" -ForegroundColor Cyan }
 function Write-OK   { param($msg) Write-Host "[OK] $msg"     -ForegroundColor Green }
 function Write-Warn { param($msg) Write-Host "[WARN] $msg"   -ForegroundColor Yellow }
 function Write-Err  { param($msg) Write-Host "[ERR] $msg"    -ForegroundColor Red }
 
 function Test-Port {
-    param($port)
+    param([int]$port)
+    $client = New-Object System.Net.Sockets.TcpClient
     try {
-        $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $port)
-        $c.Close()
-        return $true
-    } catch { return $false }
+        $asyncResult = $client.BeginConnect("127.0.0.1", $port, $null, $null)
+        $wait = $asyncResult.AsyncWaitHandle.WaitOne(400, $false)
+        if ($wait -and $client.Connected) {
+            $client.EndConnect($asyncResult)
+            $client.Close()
+            return $true
+        }
+    } catch {
+        # Not listening
+    } finally {
+        $client.Close()
+    }
+    return $false
 }
 
-# ── Start ──────────────────────────────────────────────────────────────────
+# -- Start -------------------------------------------------------------------
 function Start-Jarvis {
-    Write-Step "Starting JARVIS backend..."
-    Start-Process -FilePath "cmd.exe" `
-        -ArgumentList '/k', "cd /d `"$apiDir`" && node src/server.js" `
-        -WorkingDirectory $apiDir
+    Write-Step "Checking port 3000..."
+    if (Test-Port 3000) {
+        Write-Warn "Port 3000 is already in use."
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:3000/api/health" -TimeoutSec 3
+            Write-OK "API backend is already online (Provider: $($health.provider))."
+        } catch {
+            Write-Warn "Port 3000 is occupied but not responding as JARVIS API."
+        }
+    } else {
+        Write-Step "Starting JARVIS backend..."
+        Start-Process -FilePath "cmd.exe" `
+            -ArgumentList '/k', "title JARVIS-API & node src/server.js" `
+            -WorkingDirectory $apiDir
+        Start-Sleep -Seconds 3
+    }
 
-    Start-Sleep -Seconds 3
-
-    Write-Step "Starting JARVIS frontend..."
-    Start-Process -FilePath "cmd.exe" `
-        -ArgumentList '/k', "cd /d `"$webDir`" && npm run dev -- --host 127.0.0.1" `
-        -WorkingDirectory $webDir
-
-    Start-Sleep -Seconds 4
+    Write-Step "Checking port 5173..."
+    if (Test-Port 5173) {
+        Write-OK "Frontend is already running on port 5173."
+    } else {
+        Write-Step "Starting JARVIS frontend..."
+        Start-Process -FilePath "cmd.exe" `
+            -ArgumentList '/k', "title JARVIS-UI & npm run dev -- --host 127.0.0.1" `
+            -WorkingDirectory $webDir
+        Start-Sleep -Seconds 4
+    }
 
     if (Test-Port 3000) { Write-OK "API is online at http://127.0.0.1:3000" }
     else { Write-Warn "API may still be starting." }
@@ -63,17 +92,37 @@ function Start-Jarvis {
     Start-Process "http://localhost:5173"
 }
 
-# ── Stop ───────────────────────────────────────────────────────────────────
+# -- Stop --------------------------------------------------------------------
 function Stop-Jarvis {
     Write-Step "Stopping JARVIS services..."
 
     # Stop voice service first.
-    & "$voiceDir\stop-voice.ps1" -ErrorAction SilentlyContinue
+    $stopVoiceScript = Join-Path $voiceDir "stop-voice.ps1"
+    if (Test-Path $stopVoiceScript) {
+        & $stopVoiceScript
+    }
 
-    # Kill node processes running server.js or vite.
-    Get-Process node -ErrorAction SilentlyContinue | Where-Object {
-        $_.MainWindowTitle -match "jarvis|vite" -or
-        (Get-WmiObject Win32_Process | Where-Object { $_.ProcessId -eq $_.Id }).CommandLine -match "server\.js|vite"
+    # Stop node processes that specifically belong to JARVIS
+    $nodeProcesses = Get-Process node -ErrorAction SilentlyContinue
+    foreach ($proc in $nodeProcesses) {
+        $cmdLine = $null
+        try {
+            $wmi = Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+            if ($wmi) { $cmdLine = $wmi.CommandLine }
+        } catch {}
+
+        $isJarvis = ($proc.MainWindowTitle -match "JARVIS") -or 
+                    ($cmdLine -and ($cmdLine -match "server\.js" -or $cmdLine -match "vite"))
+
+        if ($isJarvis) {
+            Write-Step "Stopping Node process PID $($proc.Id)..."
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Stop any lingering cmd windows titled JARVIS
+    Get-Process cmd -ErrorAction SilentlyContinue | Where-Object {
+        $_.MainWindowTitle -match "JARVIS-API|JARVIS-UI"
     } | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
@@ -81,14 +130,21 @@ function Stop-Jarvis {
     Write-OK "Services stopped."
 }
 
-# ── Status ─────────────────────────────────────────────────────────────────
+# -- Status ------------------------------------------------------------------
 function Show-Status {
     Write-Step "JARVIS Service Status"
     Write-Host ""
 
     # API
     $apiOnline = Test-Port 3000
-    $apiStatus = if ($apiOnline) { "ONLINE  (http://127.0.0.1:3000)" } else { "OFFLINE" }
+    $providerInfo = ""
+    if ($apiOnline) {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:3000/api/health" -TimeoutSec 2
+            $providerInfo = " [Provider: $($health.provider)]"
+        } catch {}
+    }
+    $apiStatus = if ($apiOnline) { "ONLINE  (http://127.0.0.1:3000)$providerInfo" } else { "OFFLINE" }
     $apiColor  = if ($apiOnline) { "Green" } else { "Red" }
     Write-Host "  API Backend:   " -NoNewline; Write-Host $apiStatus -ForegroundColor $apiColor
 
@@ -98,19 +154,30 @@ function Show-Status {
     $webColor  = if ($webOnline) { "Green" } else { "Red" }
     Write-Host "  Frontend:      " -NoNewline; Write-Host $webStatus -ForegroundColor $webColor
 
-    # Voice service PID
-    $voicePidFile = "$voiceDir\jarvis-voice.pid"
+    # Voice service
+    $voicePidFile = Join-Path $voiceDir "jarvis-voice.pid"
+    $voiceDetail = "OFFLINE"
+    $voiceColor  = "Red"
+
     if (Test-Path $voicePidFile) {
         $vpid = Get-Content $voicePidFile -ErrorAction SilentlyContinue
         $vproc = if ($vpid) { Get-Process -Id $vpid -ErrorAction SilentlyContinue } else { $null }
-        if ($vproc) {
-            Write-Host "  Voice Service: " -NoNewline; Write-Host "ONLINE  (PID $vpid)" -ForegroundColor Green
+        if ($vproc -and $vproc.ProcessName -match "python") {
+            $voiceDetail = "ONLINE  (PID $vpid)"
+            $voiceColor  = "Green"
+            if ($apiOnline) {
+                try {
+                    $vs = Invoke-RestMethod -Uri "http://127.0.0.1:3000/api/voice/status" -TimeoutSec 1
+                    if ($vs.online) {
+                        $voiceDetail = "ONLINE  (PID $vpid, Status: $($vs.status.ToUpper()))"
+                    }
+                } catch {}
+            }
         } else {
-            Write-Host "  Voice Service: " -NoNewline; Write-Host "OFFLINE (stale PID file)" -ForegroundColor Red
+            $voiceDetail = "OFFLINE (stale PID file)"
         }
-    } else {
-        Write-Host "  Voice Service: " -NoNewline; Write-Host "OFFLINE" -ForegroundColor Red
     }
+    Write-Host "  Voice Service: " -NoNewline; Write-Host $voiceDetail -ForegroundColor $voiceColor
 
     # Startup task
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -121,7 +188,7 @@ function Show-Status {
     Write-Host ""
 }
 
-# ── Enable Startup ─────────────────────────────────────────────────────────
+# -- Enable Startup ----------------------------------------------------------
 function Enable-Startup {
     Write-Step "Windows Startup Setup"
     Write-Host ""
@@ -136,7 +203,7 @@ function Enable-Startup {
         exit 0
     }
 
-    $startScript = "$rootDir\start-jarvis-background.ps1"
+    $startScript = Join-Path $rootDir "start-jarvis-background.ps1"
 
     # Create a startup script that runs API + voice service in background.
     @"
@@ -160,7 +227,7 @@ Start-Sleep -Seconds 4
 Start-Process -FilePath 'powershell.exe' ``
     -ArgumentList '-NonInteractive', '-File', "`$voiceDir\start-voice.ps1" ``
     -WindowStyle Hidden
-"@ | Out-File -FilePath $startScript -Encoding utf8
+"@ | Out-File -FilePath $startScript -Encoding ascii
 
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NonInteractive -WindowStyle Hidden -File `"$startScript`""
     $trigger = New-ScheduledTaskTrigger -AtLogon
@@ -170,14 +237,14 @@ Start-Process -FilePath 'powershell.exe' ``
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Force | Out-Null
         Write-OK "Startup task '$taskName' registered successfully."
         Write-Host "  JARVIS will start automatically after your next login." -ForegroundColor DarkGray
-        Write-Host "  Disable:  .\manage-jarvis.ps1 -Action disable-startup" -ForegroundColor DarkGray
+        Write-Host "  Disable:  .\scripts\manage-jarvis.ps1 -Action disable-startup" -ForegroundColor DarkGray
     } catch {
         Write-Err "Failed to register startup task: $_"
         Write-Host "  Try running PowerShell as Administrator." -ForegroundColor Yellow
     }
 }
 
-# ── Disable Startup ────────────────────────────────────────────────────────
+# -- Disable Startup ---------------------------------------------------------
 function Disable-Startup {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if (-not $task) {
@@ -189,7 +256,7 @@ function Disable-Startup {
     Write-OK "Startup task '$taskName' removed. JARVIS will no longer start automatically."
 }
 
-# ── Check Startup ──────────────────────────────────────────────────────────
+# -- Check Startup -----------------------------------------------------------
 function Check-Startup {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($task) {
@@ -199,13 +266,13 @@ function Check-Startup {
         Write-Host "  Trigger: At log on"
     } else {
         Write-Warn "No startup task registered."
-        Write-Host "  To enable: .\manage-jarvis.ps1 -Action enable-startup"
+        Write-Host "  To enable: .\scripts\manage-jarvis.ps1 -Action enable-startup"
     }
 }
 
-# ── Open Logs ─────────────────────────────────────────────────────────────
+# -- Open Logs --------------------------------------------------------------
 function Open-Logs {
-    $logFile = "$voiceDir\logs\jarvis-voice.log"
+    $logFile = Join-Path $voiceDir "logs\jarvis-voice.log"
     if (Test-Path $logFile) {
         notepad.exe $logFile
     } else {
@@ -214,14 +281,18 @@ function Open-Logs {
     }
 }
 
-# ── Dispatch ────────────────────────────────────────────────────────────────
+# -- Dispatch ----------------------------------------------------------------
 switch ($Action) {
     "start"           { Start-Jarvis }
     "stop"            { Stop-Jarvis }
     "restart"         { Stop-Jarvis; Start-Sleep -Seconds 2; Start-Jarvis }
     "status"          { Show-Status }
-    "start-voice"     { & "$voiceDir\start-voice.ps1" }
-    "stop-voice"      { & "$voiceDir\stop-voice.ps1" }
+    "start-voice"     { & (Join-Path $voiceDir "start-voice.ps1") }
+    "stop-voice"      { & (Join-Path $voiceDir "stop-voice.ps1") }
+    "pause-voice"     { & (Join-Path $voiceDir "control-voice.ps1") -Command pause }
+    "resume-voice"    { & (Join-Path $voiceDir "control-voice.ps1") -Command resume }
+    "mute-voice"      { & (Join-Path $voiceDir "control-voice.ps1") -Command mute }
+    "unmute-voice"    { & (Join-Path $voiceDir "control-voice.ps1") -Command unmute }
     "logs"            { Open-Logs }
     "enable-startup"  { Enable-Startup }
     "disable-startup" { Disable-Startup }

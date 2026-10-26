@@ -24,6 +24,9 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { GoogleGenAI } from "@google/genai";
 
 import {
@@ -97,8 +100,13 @@ let voiceServiceState = {
     status: "offline",
     wakeWordActive: false,
     listening: false,
+    speaking: false,
+    processing: false,
     muted: false,
+    paused: false,
+    error: null,
 };
+let pendingVoiceCommand = null;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
@@ -168,17 +176,38 @@ app.get("/api/system/info", async (_req, res) => {
     }
 });
 
-// ─── Voice Service ────────────────────────────────────────────────────────────
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const VOICE_PID_PATH = path.resolve(__dirname, "../../voice/jarvis-voice.pid");
+
+function isVoiceProcessRunning() {
+    try {
+        if (!fs.existsSync(VOICE_PID_PATH)) return false;
+        const pidStr = fs.readFileSync(VOICE_PID_PATH, "utf-8").trim();
+        const pid = parseInt(pidStr, 10);
+        if (!pid || isNaN(pid)) return false;
+        process.kill(pid, 0); // throws ESRCH on Windows if process does not exist
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 app.get("/api/voice/status", (_req, res) => {
-    // Mark offline if no heartbeat in 15 seconds.
     const age = voiceServiceState.lastHeartbeat
         ? Date.now() - new Date(voiceServiceState.lastHeartbeat).getTime()
         : Infinity;
 
-    if (age > 15_000) {
+    const procRunning = isVoiceProcessRunning();
+
+    // Mark offline if no heartbeat in 5 seconds or if the Python process is not alive
+    if (age > 5_000 || !procRunning) {
         voiceServiceState.online = false;
         voiceServiceState.status = "offline";
+        voiceServiceState.wakeWordActive = false;
+        voiceServiceState.listening = false;
+        voiceServiceState.speaking = false;
+        voiceServiceState.processing = false;
     }
 
     res.json(voiceServiceState);
@@ -188,13 +217,43 @@ app.post("/api/voice/heartbeat", (req, res) => {
     voiceServiceState = {
         online: true,
         lastHeartbeat: new Date().toISOString(),
-        status: req.body?.status ?? "idle",
+        status: req.body?.status ?? "listening",
         wakeWordActive: req.body?.wakeWordActive ?? false,
         listening: req.body?.listening ?? false,
+        speaking: req.body?.speaking ?? false,
+        processing: req.body?.processing ?? false,
         muted: req.body?.muted ?? false,
+        paused: req.body?.paused ?? false,
+        error: req.body?.error ?? null,
     };
 
-    res.json({ received: true });
+    const cmd = pendingVoiceCommand;
+    pendingVoiceCommand = null;
+
+    res.json({ received: true, command: cmd });
+});
+
+app.post("/api/voice/control", (req, res) => {
+    const { command } = req.body ?? {};
+    if (!["pause", "resume", "mute", "unmute", "stop"].includes(command)) {
+        return res.status(400).json({ error: "Invalid command. Supported: pause, resume, mute, unmute, stop." });
+    }
+
+    pendingVoiceCommand = command;
+
+    if (command === "pause") {
+        voiceServiceState.paused = true;
+        voiceServiceState.status = "paused";
+    } else if (command === "resume") {
+        voiceServiceState.paused = false;
+        voiceServiceState.status = "listening";
+    } else if (command === "mute") {
+        voiceServiceState.muted = true;
+    } else if (command === "unmute") {
+        voiceServiceState.muted = false;
+    }
+
+    res.json({ ok: true, command, state: voiceServiceState });
 });
 
 // ─── Actions ──────────────────────────────────────────────────────────────────
@@ -324,7 +383,12 @@ app.post("/api/agent", async (req, res) => {
                 });
             }
         } catch (err) {
-            return res.status(500).json({ error: `AI planning failed: ${err.message}` });
+            console.warn("AI planning fallback:", err.message);
+            return res.json({
+                reply: `I heard "${cleanMessage}", Sir, but I could not find a matching command or reach the AI planner.`,
+                mode: "no-action",
+                error: err.message,
+            });
         }
     }
 
@@ -411,14 +475,19 @@ function buildAgentReply(message, plan, result) {
                 return `GitHub CLI is not authenticated, Sir. Run "gh auth login" in a terminal to connect.`;
 
             case "CANCEL_SHUTDOWN":
-                return firstResult?.success
+                return firstResult?.cancelled
                     ? "The pending shutdown has been cancelled, Sir."
-                    : `No shutdown was scheduled, Sir.`;
+                    : (firstResult?.message || "No shutdown was scheduled, Sir.");
 
             case "OPEN_APP":
                 return plan.appName
                     ? `Opening ${plan.appName} for you, Sir.`
                     : "Done, Sir. The application is opening.";
+
+            case "OPEN_FOLDER":
+                return plan.folderName
+                    ? `Opening ${plan.folderName} in File Explorer, Sir.`
+                    : "Opening folder in File Explorer, Sir.";
 
             case "LOCK_PC":
                 return "Locking your workstation now, Sir.";

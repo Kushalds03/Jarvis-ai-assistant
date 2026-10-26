@@ -162,6 +162,6 @@ function buildSummary(plan, results, failed) {
     return `Completed ${successCount} of ${total} steps. ` +
         results
             .filter((r) => !r.success)
-            .map((r) => `${r.actionId}: ${r.error}`)
+            .map((r) => `${r.actionId}: ${r.error || r.result?.message || "Failed"}`)
             .join("; ");
 }
