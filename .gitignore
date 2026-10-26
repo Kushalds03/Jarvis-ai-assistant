@@ -1,7 +1,55 @@
 
+# ─── Node / npm ─────────────────────────────────────────────────────────────
 node_modules/
 dist/
+.vite/
+
+# ─── Environment & Secrets ───────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
+
+# ─── Database ────────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite3
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+.env/
+
+# ─── Voice service runtime files ─────────────────────────────────────────────
+services/voice/jarvis-voice.pid
+services/voice/logs/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Backups ─────────────────────────────────────────────────────────────────
+*.bak
+*.bak_*
+server.js.bak_*
+
+# ─── OS artifacts ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Editor ──────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# ─── Auto-generated startup script ───────────────────────────────────────────
+start-jarvis-background.ps1
